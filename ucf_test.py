@@ -11,7 +11,7 @@ BASE_CLASSES = ['Abuse', 'Assault', 'Burglary', 'RoadAccidents', 'Robbery', 'Ste
 NOVEL_CLASSES = ['Arrest', 'Arson', 'Explosion', 'Fighting', 'Shooting', 'Shoplifting', 'Vandalism']
 ALL_CLASSES = BASE_CLASSES + NOVEL_CLASSES
 
-class UCFClipFeatFolderDataset(Dataset):
+class UCFClipFeatFolderDatasetTest(Dataset):
 
     @staticmethod
     def norm_name(name):
@@ -49,7 +49,12 @@ class UCFClipFeatFolderDataset(Dataset):
         for line in lines:
             rel_path_mp4 = line.strip()                  # 例如 'Arson/Arson011_x264.mp4'
             mp4_name = os.path.basename(rel_path_mp4)    # 'Arson011_x264.mp4'
-            rel_path_npy = rel_path_mp4.replace('.mp4', '.npy')
+            # rel_path_npy = rel_path_mp4.replace('.mp4', '.npy')
+            '''
+            TH's change。
+            同train，取__1.npy来测试。
+            '''
+            rel_path_npy = rel_path_mp4.replace('.mp4', '__0.npy')
             full_path = os.path.join(feat_root, rel_path_npy)
             if not os.path.exists(full_path):
                 print(f"[Warning] Missing file: {full_path}")
@@ -68,7 +73,7 @@ class UCFClipFeatFolderDataset(Dataset):
             self.labels.append(label)
             self.video_names.append(mp4_name)
 
-        print("最终样本统计：")
+        print("测试集最终样本统计：")
         print("正常样本数：", sum(1 for l in self.labels if l == -1))
         print("异常样本数：", sum(1 for l in self.labels if l != -1))
 
@@ -328,6 +333,7 @@ def test_with_ski_prompt(model, test_loader, device, base_classes, novel_classes
     print(f"Base     AUC: {base_auc:.4f}  AP: {base_ap:.4f}")
     print(f"Novel    AUC: {novel_auc:.4f}  AP: {novel_ap:.4f}")
     print("===================================")
+    return overall_auc, base_auc, novel_auc, overall_ap, base_ap, novel_ap
 
 def test_with_dummy_prompt(model, test_loader, device, base_classes, novel_classes):
     """
@@ -340,9 +346,13 @@ def test_with_dummy_prompt(model, test_loader, device, base_classes, novel_class
     base_labels, base_scores = [], []
     novel_labels, novel_scores = [], []
 
-    num_class = model.classifier.out_features
-    prompt_embs = torch.ones(num_class, 512, device=device)
-
+    # num_class = model.classifier.out_features
+    # prompt_embs = torch.ones(num_class, 512, device=device)
+    '''
+    TH's change
+    试一下直接给数字
+    '''
+    prompt_embs = torch.ones(13, 512, device=device)
     with torch.no_grad():
         for video_features, text_prompts, labels, label_strs, frame_labels in test_loader:
             # video_features: [B, T, C]
@@ -410,51 +420,101 @@ def test_with_dummy_prompt(model, test_loader, device, base_classes, novel_class
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    clip_model = CLIPModel.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")  # 路径替换为你的本地路径
-    clip_processor = CLIPProcessor.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")
+    # clip_model = CLIPModel.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")  # 路径替换为你的本地路径
+    # clip_processor = CLIPProcessor.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")
+    
+    clip_model = CLIPModel.from_pretrained("./clip/clip_model")
+    clip_processor = CLIPProcessor.from_pretrained("./clip/clip_processor")
     clip_model = clip_model.to(device)
+    '''
+    #第三版，各一百个，动名词混合   
+    '''
+    normal_prompts = [
+    "street", "park", "office", "classroom", "kitchen", "supermarket", "shopping mall", "restaurant", "cafeteria", "library",
+    "parking lot", "hospital", "corridor", "laboratory", "train station", "bus stop", "playground", "meeting room", "garden", "living room",
+    "office desk", "shop", "lobby", "hallway", "crosswalk", "market", "coffee shop", "sports field", "warehouse", "subway station",
+    "gym", "cinema", "home", "elevator", "store", "museum", "reception desk", "bridge", "stadium", "canteen",
+    "corridor area", "computer room", "dining area", "public square", "campus", "office building", "bank", "bakery", "bus interior", "car interior",
+    "walking", "running", "talking", "reading", "cooking", "cleaning", "studying", "resting", "driving", "parking",
+    "eating", "drinking", "working", "chatting", "shopping", "typing", "relaxing", "exercising", "walking dog", "sitting",
+    "standing", "waiting", "watching", "opening door", "closing door", "paying bill", "queuing", "crossing street", "answering phone", "checking phone",
+    "taking photos", "folding clothes", "watering plants", "walking upstairs", "walking downstairs", "teaching", "attending meeting", "loading luggage", "unloading luggage", "walking together",
+    "delivering package", "browsing shelves", "people gathering", "walking on sidewalk", "sitting quietly", "walking through hallway", "resting on chair", "people passing by"
+    ]
 
-    normal_prompts = [    "street","sidewalk","crosswalk","alley","parking lot","gas station","shopping mall",
-    "supermarket aisle","convenience store","checkout counter","office lobby","school hallway",
-    "metro station","train platform","bus stop","park","plaza","playground","residential block",
-    "apartment corridor","elevator lobby","stairwell","warehouse aisle","loading dock","campus quad",
-    "cafeteria","hotel lobby","pharmacy","bank lobby","public square"]
-    abnormal_prompts = [    "walking","standing","queueing","browsing shelves","window shopping","talking","calling on a phone",
-    "texting","jogging","cycling","pushing a cart","carrying bags","entering","exiting","waiting",
-    "cleaning","sweeping","mopping","stocking goods","delivering packages","checking out",
-    "paying at cashier","taking an escalator","using an elevator","stretching","tying shoelaces",
-    "adjusting a backpack","greeting","waving","sitting on a bench"]
+    abnormal_prompts = [
+    "fire", "explosion", "smoke", "blood", "weapon", "knife", "gun", "firelight", "firetruck", "police car",
+    "ambulance", "fight scene", "robbery scene", "crash site", "burning vehicle", "destroyed building", "collapsed wall", "crowd chaos", "dangerous road", "car accident",
+    "emergency area", "broken glass", "damaged shop", "street conflict", "riot", "panic crowd", "fallen person", "fire alarm", "street fire", "violent scene",
+    "crime scene", "shooting area", "injured person", "vandalized area", "traffic collision", "explosion site", "crowd running", "gas leak", "smashed window", "wrecked car",
+    "broken barrier", "robbery place", "fire zone", "shouting crowd", "gunfire sound", "debris", "alarm sound", "car fire", "collapsing structure", "screaming people",
+    "dangerous place", "fighting", "stealing", "breaking glass", "shooting", "stabbing", "burning", "falling", "collapsing", "running away",
+    "attacking", "chasing", "arguing", "punching", "kicking", "pushing", "escaping", "fainting", "bleeding", "vandalizing",
+    "trespassing", "jumping fence", "breaking in", "destroying property", "lying on ground", "robbing", "overturning table", "setting fire", "kicking door", "breaking window",
+    "shouting", "throwing objects", "pushing crowd", "smashing glass", "climbing wall", "reckless driving", "abnormal running", "jumping from height", "running across traffic", "throwing punches",
+    "violent action", "panic behavior", "car overturn", "running toward danger", "grabbing bag", "breaking lock", "sudden explosion", "emergency event", "crowd panic", "dangerous behavior", "person injured"
+    ]
+    
 
+    use_ta = True
+    use_ski = True
+    train_and_finetune_together = True
+    name = ''
+    if train_and_finetune_together:
+        name += '_and_finetune_together'
+    else:  
+        if use_ta:
+            name += '_TA'
+        if use_ski:
+            name += '_SKI'
+        elif not use_ta and not use_ski:
+            name += '_nothing'
     model = OVVADModel(
         clip_model=clip_model,
         clip_processor=clip_processor,
         normal_prompts=normal_prompts,
         abnormal_prompts=abnormal_prompts,
         num_classes=len(ALL_CLASSES),
-        use_ta=True,
-        use_ski=True
+        use_ta=use_ta,
+        use_ski=use_ski
     ).to(device)
 
     model.ski_module.clip_processor = clip_processor
+    model.load_state_dict(torch.load(f'models/ucf_ovvad_train{name}.pth', map_location=device))
 
-    model.load_state_dict(torch.load('models/ucf_ovvad_final.pth', map_location=device))
+    if train_and_finetune_together == False:
+        model_finetune = OVVADModel(
+            clip_model=clip_model,
+            clip_processor=clip_processor,
+            normal_prompts=normal_prompts,
+            abnormal_prompts=abnormal_prompts,
+            num_classes=len(ALL_CLASSES),
+            use_ta=use_ta,
+            use_ski=use_ski
+        ).to(device)
+        model_finetune.ski_module.clip_processor = clip_processor
+        model_finetune.load_state_dict(torch.load(f'models/ucf_ovvad_finetune{name}.pth', map_location=device))
 
-    FEAT_ROOT = "/data/UCF_Crimes/Features/Video"   # 测试集特征主目录
-    list_file = "/data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Test.txt"  # 的实际txt文件路径
+    FEAT_ROOT = r"./data/UCF_Crimes/Features/Video"   # 测试集特征主目录
+    list_file = r"./data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Test.txt"  # 的实际txt文件路径
 
     # 推荐 batch_size=1（或用前面给过的 pad_collate 保证不截断）
-    test_dataset = UCFClipFeatFolderDataset(
+    test_dataset = UCFClipFeatFolderDatasetTest(
         FEAT_ROOT,
         list_file=list_file,
         max_frames=None,  # 或者给个很大的数；关键是不截断
-        anno_txt="/data/UCF_Crimes/E_Features/Temporal_Anomaly_Annotation.txt",
-        video_root="/data/UCF_Crimes/Videos",  # 你的原始视频根目录
+        anno_txt=r"./data/UCF_Crimes/E_Features/Temporal_Anomaly_Annotation.txt",
+        # video_root="/data/UCF_Crimes/Videos",  # 你的原始视频根目录
         feat_stride=16  # 作为回退；线性缩放拿不到总帧数时才用
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     # 跑两个版本
+    print("==== 训练版本 ====")
     test_with_ski_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+    if train_and_finetune_together == False:
+        print("==== 微调版本 ====")
+        test_with_ski_prompt(model_finetune, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
     # test_with_dummy_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
 
 

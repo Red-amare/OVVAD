@@ -1,0 +1,533 @@
+import os
+import torch
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+from collections import Counter
+from transformers import CLIPModel, CLIPProcessor
+'''
+TH's change
+1 可学习温度因子，初始设为0.07
+2 温度因子(可学习参数)删除,或者理解为固定为1不学习-------还行，但是没有本质区别，感觉就是一些误差
+3 固定温度因子为0.07不学习-----------------------------效果不好
+4 可学习温度因子，初始设为0.07，但是SKI模块最后变回512---效果不好，ski反而不如nothing了
+'''
+from model import OVVADModel, topk_pooling
+from collections import Counter
+import pandas as pd
+
+BASE_CLASSES = ['fighting','shooting','car accident']
+NOVEL_CLASSES = ['riot', 'abuse','explosion']
+ALL_CLASSES = BASE_CLASSES + NOVEL_CLASSES
+
+class XDClipFeatFolderDatasetTest(Dataset):
+
+    @staticmethod
+    def norm_name(name):
+        import os, re
+        base = os.path.basename(name).lower()
+        base = base[:-7]  # 去掉 __x.npy
+        return base
+
+    def __init__(self, list_file, max_frames=256, class_names=ALL_CLASSES,
+                 anno_txt="annotations.txt",
+                 video_root=None,             # << 新增：原始视频根目录（可选）
+                 feat_stride=None):           # << 不再强依赖固定N；可留作回退
+        """
+        feat_stride: 一个特征向量代表多少原始帧。
+          - 如果你的 .npy 是逐帧特征 -> feat_stride=1
+          - 如果你的 .npy 是以 16 帧一个特征 -> feat_stride=16
+        """
+        self.samples = []          # 保存特征 .npy 的完整路径
+        self.labels = []           # 视频级二分类：-1=Normal, 0..=异常类索引
+        self.video_names = []      # 保存原始 mp4 文件名（如 'Arson011_x264.mp4'）
+        self.max_frames = max_frames
+
+        self.video_root = video_root
+        self.frame_count_cache = {}          # << 缓存：mp4_name -> total_frames(int)
+        self.feat_stride = feat_stride
+        self.feat_stride = feat_stride
+        self.class2idx = {c: i for i, c in enumerate(class_names)}
+        self.ann = load_temporal_annotations(anno_txt)  # 读入区间标注
+        self.XD_LABEL_MAP = {'A': 'normal', 'B1': 'fighting', 'B2': 'shooting', 
+        'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion'}
+
+
+        df = pd.read_csv(list_file, header=0)  # header=0表示第一行为表头，无表头可设为None
+
+        all_path = df.iloc[:, 0]
+        all_label = df.iloc[:, 1]
+        for path, label in zip(all_path, all_label):
+            if not os.path.exists(path):
+                print(f"[Warning] Missing file: {path}")
+                continue
+            # 类别
+            mp4_name = os.path.basename(path)  # 'Arson011_x264.mp4'
+            class_name = label[0] if label[0]=='G' or label[0]=='A' else label[:2]
+            class_name = self.XD_LABEL_MAP[class_name]
+            # print(f"class_name: {class_name}")
+            if 'normal' in class_name:
+                label = -1
+            else:
+                label = self.class2idx.get(class_name, None)
+                if label is None:
+                    print(f"[Warning] Unknown class: {class_name}")
+                    continue
+            self.samples.append(path)
+            self.labels.append(label)
+            self.video_names.append(mp4_name)
+
+        print("最终样本统计：")
+        print("正常样本数：", sum(1 for l in self.labels if l == -1))
+        print("异常样本数：", sum(1 for l in self.labels if l != -1))
+
+        # 1) 标注条数
+        print("标注条数:", len(self.ann))
+
+        # 2) 命中率（名称匹配）
+        import re
+        def norm_name(name):
+            base = os.path.basename(name).lower()
+            base = re.sub(r'\.(mp4|avi|mkv|npy)$', '', base)  # 去掉扩展名
+            base = base[:-3]## 去掉 __x
+            return base
+
+        ann_keys_norm = {k for k in self.ann.keys()}
+        # print(f"ann_keys_norm: {ann_keys_norm}")
+        hits = 0
+        miss_samples = []
+        for mp4 in self.video_names:
+            # print(f"标注命中视频: {norm_name(mp4)}")
+            if norm_name(mp4) in ann_keys_norm:
+                hits += 1
+            else:
+                miss_samples.append(mp4)
+        print(f"标注命中视频数: {hits}/{len(self.video_names)}")
+        print("示例未命中:", miss_samples[:10])
+
+        # 3) 正帧统计（抽样，避免太慢）
+        pos = 0
+        sample_n = min(len(self), 200)
+        for i in range(sample_n):
+            _, _, _, _, fl = self[i]  # 调用 __getitem__
+            pos += int(fl.sum().item())
+        print("抽样正帧总数:", pos)
+
+        # 4) 抽查一个异常类视频的区间映射
+        for i in range(len(self)):
+            if self.labels[i] != -1:
+                v = self.video_names[i]
+                print("样例异常视频:", v, "标注区间(规范化):", self.ann.get(self.norm_name(v), "None"))
+                print("样例异常视频(规范化)是否命中：", self.norm_name(v) in ann_keys_norm)
+                break
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _get_total_frames(self, mp4_name):
+        """读取/缓存原始视频总帧数；拿不到就返回 None。"""
+        if mp4_name in self.frame_count_cache:
+            return self.frame_count_cache[mp4_name]
+        if self.video_root is None:
+            return None
+        # 通过 list_file 的相对路径可得到子目录
+        # 这里假设 self.samples / self.video_names 对应 mp4_name = 'Class/Video_x264.mp4' 或只文件名
+        # 你如果在 __init__ 里已经存了 rel_path_mp4，可以直接用它；这里用最保守的拼法：
+        cand_paths = [
+            os.path.join(self.video_root, mp4_name),                     # 仅文件名
+        ]
+        # 如果你保存了相对目录（推荐在 __init__ 里一并保存），可以加一条带子目录的候选路径
+        # cand_paths.append(os.path.join(self.video_root, rel_dir, mp4_name))
+
+        total = None
+        for p in cand_paths:
+            if os.path.exists(p):
+                cap = cv2.VideoCapture(p)
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
+                break
+        if total is not None and total > 0:
+            self.frame_count_cache[mp4_name] = total
+        return total
+
+
+    def _make_frame_labels(self, T, mp4_name):
+        """
+        用线性缩放把原始帧区间映射到特征索引。
+        回退策略：如果拿不到 total_frames，则按旧的 feat_stride（N）去整除映射。
+        """
+        labels = np.zeros(T, dtype=np.float32)
+        segs = self.ann.get(self.norm_name(mp4_name), [])
+        # print(f"norm(mp4_name):{self.norm_name(mp4_name)},seg:{segs}")
+        # k = input("pause")
+
+        if len(segs) == 0 or T <= 0:
+            return labels
+
+        total_frames = self._get_total_frames(mp4_name)
+
+        if total_frames is not None and total_frames > 0:
+            # === 线性缩放映射（推荐） ===
+            # 标注常见是 1-based 且含端：先转 0-based
+            for s, e in segs:
+                s0 = max(0, s - 1)
+                e0 = max(0, e - 1)
+                # 映射到 [0, T-1]，用 floor；并确保闭区间
+                fs = int(np.floor(s0 * T / total_frames))
+                fe = int(np.floor(e0 * T / total_frames))
+                fs = max(0, min(T - 1, fs))
+                fe = max(fs, min(T - 1, fe))
+                labels[fs:fe+1] = 1.0
+            return labels
+        else:
+            # === 回退：还用固定步长 N 的闭区间“向下取整” ===
+            if not self.feat_stride:
+                # 没给 N：尝试估个近似N，避免严重漂移
+                # 比如用一个保守整数：max(1, round(1.0 * total_frames / T))；但 total_frames=None 时只能用16作兜底
+                N = 16
+            else:
+                N = int(self.feat_stride)
+            for s, e in segs:
+                s0 = max(0, s - 1); e0 = max(0, e - 1)
+                fs = s0 // N
+                fe = max(fs, e0 // N)
+                fs = max(0, min(T - 1, fs))
+                fe = max(fs, min(T - 1, fe))
+                labels[fs:fe+1] = 1.0
+            return labels
+
+    def __getitem__(self, idx):
+        feat = np.load(self.samples[idx])          # [T, C]
+        feat = torch.tensor(feat, dtype=torch.float32)
+        T, C = feat.shape
+
+        mp4_name = self.video_names[idx]
+        # 先按原始长度 T 生成帧标签（特征帧级）
+        frame_labels_np = self._make_frame_labels(T, mp4_name)    # [T]
+        frame_labels = torch.from_numpy(frame_labels_np)
+
+        # 只在 T < max_frames 时做 padding；否则不做任何截断
+        if self.max_frames is not None and T < self.max_frames:
+            pad_len = self.max_frames - T
+            feat = torch.cat([feat, torch.zeros(pad_len, C)], dim=0)
+            frame_labels = torch.cat([frame_labels, torch.zeros(pad_len)], dim=0)
+
+        # 二分类视频标签：是否有异常帧
+        binary_label = 1.0 if frame_labels.sum().item() > 0 else 0.0
+
+        # 文本提示与类别名（可选）
+        label = self.labels[idx]
+        if label == -1:
+            class_name = "normal"
+            text_prompt = "normal activity"
+        else:
+            class_name = list(self.class2idx.keys())[label]
+            text_prompt = class_name.lower()
+
+        return feat, text_prompt, torch.tensor(binary_label, dtype=torch.float32), class_name, frame_labels
+
+def load_temporal_annotations(txt_path):
+    ann = {}
+    import re, os
+    def norm_name(name):
+        base = os.path.basename(name).lower()
+        base = re.sub(r'\.(mp4|avi|mkv|npy)$', '', base)  # 去掉扩展名
+        return base
+
+    with open(txt_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            # print(f"len(parts)={len(parts)}")
+            # 校验格式：至少需要 [视频名-类别, s1, e1]（4个部分），且后续每2个部分为一组(s,e)，这个注释的label和类别信息是一块的
+            if len(parts) < 3 or (len(parts) - 1) % 2 != 0:
+                print(f"跳过无效行：{line}（格式错误，需满足 [视频名 类别 s1 e1 (s2 e2 ...)]）")
+                continue
+            vid = parts[0]
+            segs = []
+            # 从第2个部分开始，每2个部分为一组(s,e)，循环读取所有区间
+            for i in range(1, len(parts), 2):
+                s = int(parts[i])
+                e = int(parts[i + 1])
+                if s >= 0 and e >= 0:  # 只保留有效区间（s和e均非负）
+                    segs.append((s, e))
+            ann[norm_name(vid)] = segs
+            # print(f"ann{ann}")
+            # k =input("pause")
+    return ann
+
+
+def safe_roc_auc(y_true, y_score):
+    from sklearn.metrics import roc_auc_score
+    classes = set(y_true)
+    if len(classes) < 2:
+        return float('nan')
+    return roc_auc_score(y_true, y_score)
+
+def safe_average_precision(y_true, y_score):
+    from sklearn.metrics import average_precision_score
+    classes = set(y_true)
+    if len(classes) < 2:
+        return float('nan')
+    return average_precision_score(y_true, y_score)
+
+def test_with_ski_prompt(model, test_loader, device, base_classes, novel_classes):
+    """
+    论文主文标准实现（frame-level评测）：
+      - 每一帧都统计异常分数和帧标签
+      - base组=normal所有帧+base异常帧
+      - novel组=normal所有帧+novel异常帧
+    """
+    import numpy as np
+    from collections import Counter
+
+    model.eval()
+    all_labels, all_scores = [], []
+    base_labels, base_scores = [], []
+    novel_labels, novel_scores = [], []
+
+    # 获取SKI prompt embedding
+    prompt_embs = model.ski_module.semantic_emb.to(device) if hasattr(model.ski_module, "semantic_emb") else None
+
+    with torch.no_grad():
+        for batch in test_loader:
+            # 支持带/不带 text_prompts（不影响推理，只要label_strs和frame_labels在）
+            if len(batch) == 5:
+                video_features, text_prompts, labels, label_strs, frame_labels = batch
+            else:
+                video_features, labels, label_strs, frame_labels = batch
+            video_features = video_features.to(device)
+            frame_scores, _ = model(video_features)   # [B, T]
+            probs = torch.sigmoid(frame_scores).cpu().numpy()      # [B, T]
+
+            labels = labels.cpu().numpy()
+            frame_labels = frame_labels.cpu().numpy()
+
+            for i, cls_name in enumerate(label_strs):
+                # 有效帧数（防止padding）
+                valid_len = (np.abs(video_features[i].cpu().numpy()).sum(axis=1) != 0).sum()
+                frame_score = probs[i, :valid_len]
+                frame_label = frame_labels[i, :valid_len]
+
+                # 汇总overall
+                all_scores.extend(frame_score.tolist())
+                all_labels.extend(frame_label.tolist())
+                # 分组
+                if cls_name == "normal":
+                    base_scores.extend(frame_score.tolist())
+                    base_labels.extend(frame_label.tolist())
+                    novel_scores.extend(frame_score.tolist())
+                    novel_labels.extend(frame_label.tolist())
+                elif cls_name in base_classes:
+                    base_scores.extend(frame_score.tolist())
+                    base_labels.extend(frame_label.tolist())
+                elif cls_name in novel_classes:
+                    novel_scores.extend(frame_score.tolist())
+                    novel_labels.extend(frame_label.tolist())
+                else:
+                    print(f"Warning: Unknown class {cls_name}")
+
+    print("==== 只命中453是删除了xd中的多类别数据部分====")
+    # 打印帧数分布，便于对齐论文
+    print("==== XD-Crime Frame-level Results (SKI Prompt, Paper Standard) ====")
+    print("Overall label dist:", Counter(all_labels))
+    print("Base label dist:", Counter(base_labels))
+    print("Novel label dist:", Counter(novel_labels))
+
+    # 计算AUC与AP
+    overall_auc = safe_roc_auc(all_labels, all_scores)
+    overall_ap = safe_average_precision(all_labels, all_scores)
+    base_auc = safe_roc_auc(base_labels, base_scores)
+    base_ap = safe_average_precision(base_labels, base_scores)
+    novel_auc = safe_roc_auc(novel_labels, novel_scores)
+    novel_ap = safe_average_precision(novel_labels, novel_scores)
+
+    print(f"Overall  AUC: {overall_auc:.4f}  AP: {overall_ap:.4f}")
+    print(f"Base     AUC: {base_auc:.4f}  AP: {base_ap:.4f}")
+    print(f"Novel    AUC: {novel_auc:.4f}  AP: {novel_ap:.4f}")
+    print("===================================")
+    return overall_auc, base_auc, novel_auc, overall_ap, base_ap, novel_ap
+
+def test_with_dummy_prompt(model, test_loader, device, base_classes, novel_classes):
+    """
+    论文主文标准实现：
+      - 每一帧都统计异常分数和帧标签
+      - 统计所有帧的 ROC/AUC，分 overall/base/novel
+    """
+    model.eval()
+    all_labels, all_scores = [], []
+    base_labels, base_scores = [], []
+    novel_labels, novel_scores = [], []
+
+    num_class = model.classifier.out_features
+    prompt_embs = torch.ones(num_class, 512, device=device)
+
+    with torch.no_grad():
+        for video_features, text_prompts, labels, label_strs, frame_labels in test_loader:
+            # video_features: [B, T, C]
+            # frame_labels:   [B, T]  # 帧标签（每一帧是0或1）
+
+            video_features = video_features.to(device)
+            frame_scores, _ = model(video_features, prompt_embs)  # [B, T]
+            probs = torch.sigmoid(frame_scores)                   # [B, T]
+
+            for i, cls_name in enumerate(label_strs):
+                # 有效帧
+                video_feat = video_features[i]
+                valid_len = (video_feat.abs().sum(dim=1) != 0).sum().item()
+                frame_score = probs[i, :valid_len].cpu().numpy()
+                frame_label = frame_labels[i, :valid_len].cpu().numpy()   # [valid_len]
+
+                # 汇总所有帧分数与帧标签
+                all_scores.extend(frame_score.tolist())
+                all_labels.extend(frame_label.tolist())
+
+                # 分组
+                if cls_name == "Normal":
+                    # 全部normal帧加入base/novel
+                    base_labels.extend(frame_label.tolist())
+                    base_scores.extend(frame_score.tolist())
+                    novel_labels.extend(frame_label.tolist())
+                    novel_scores.extend(frame_score.tolist())
+                elif cls_name in base_classes:
+                    # 仅base类异常帧进base组
+                    base_labels.extend(frame_label.tolist())
+                    base_scores.extend(frame_score.tolist())
+                elif cls_name in novel_classes:
+                    # 仅novel类异常帧进novel组
+                    novel_labels.extend(frame_label.tolist())
+                    novel_scores.extend(frame_score.tolist())
+                else:
+                    print(f"Warning: Unknown class {cls_name}")
+
+    print("==== XD-Crime Frame-level Results (Paper Standard) ====")
+    from collections import Counter
+    print("Overall label dist:", Counter(all_labels))
+    print("Base label dist:", Counter(base_labels))
+    print("Novel label dist:", Counter(novel_labels))
+
+    overall_auc = safe_roc_auc(all_labels, all_scores)
+    base_auc = safe_roc_auc(base_labels, base_scores)
+    novel_auc = safe_roc_auc(novel_labels, novel_scores)
+    print(f"Overall  AUC: {overall_auc:.4f}")
+    print(f"Base     AUC: {base_auc:.4f}")
+    print(f"Novel    AUC: {novel_auc:.4f}")
+    print("===================================")
+
+    overall_auc = safe_roc_auc(all_labels, all_scores)
+    overall_ap = safe_average_precision(all_labels, all_scores)
+    base_auc = safe_roc_auc(base_labels, base_scores)
+    base_ap = safe_average_precision(base_labels, base_scores)
+    novel_auc = safe_roc_auc(novel_labels, novel_scores)
+    novel_ap = safe_average_precision(novel_labels, novel_scores)
+    print(f"Overall  AUC: {overall_auc:.4f}  AP: {overall_ap:.4f}")
+    print(f"Base     AUC: {base_auc:.4f}  AP: {base_ap:.4f}")
+    print(f"Novel    AUC: {novel_auc:.4f}  AP: {novel_ap:.4f}")
+    print("===================================")
+
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # clip_model = CLIPModel.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")  # 路径替换为你的本地路径
+    # clip_processor = CLIPProcessor.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")
+    
+    clip_model = CLIPModel.from_pretrained("./clip/clip_model")
+    clip_processor = CLIPProcessor.from_pretrained("./clip/clip_processor")
+    clip_model = clip_model.to(device)
+
+
+    '''
+    第三版，各一百个，动名词混合
+    '''
+    normal_prompts = [
+    "street", "park", "office", "classroom", "kitchen", "supermarket", "shopping mall", "restaurant", "cafeteria", "library",
+    "parking lot", "hospital", "corridor", "laboratory", "train station", "bus stop", "playground", "meeting room", "garden", "living room",
+    "office desk", "shop", "lobby", "hallway", "crosswalk", "market", "coffee shop", "sports field", "warehouse", "subway station",
+    "gym", "cinema", "home", "elevator", "store", "museum", "reception desk", "bridge", "stadium", "canteen",
+    "corridor area", "computer room", "dining area", "public square", "campus", "office building", "bank", "bakery", "bus interior", "car interior",
+    "walking", "running", "talking", "reading", "cooking", "cleaning", "studying", "resting", "driving", "parking",
+    "eating", "drinking", "working", "chatting", "shopping", "typing", "relaxing", "exercising", "walking dog", "sitting",
+    "standing", "waiting", "watching", "opening door", "closing door", "paying bill", "queuing", "crossing street", "answering phone", "checking phone",
+    "taking photos", "folding clothes", "watering plants", "walking upstairs", "walking downstairs", "teaching", "attending meeting", "loading luggage", "unloading luggage", "walking together",
+    "delivering package", "browsing shelves", "people gathering", "walking on sidewalk", "sitting quietly", "walking through hallway", "resting on chair", "people passing by"
+    ]
+
+    abnormal_prompts = [
+    "fire", "explosion", "smoke", "blood", "weapon", "knife", "gun", "firelight", "firetruck", "police car",
+    "ambulance", "fight scene", "robbery scene", "crash site", "burning vehicle", "destroyed building", "collapsed wall", "crowd chaos", "dangerous road", "car accident",
+    "emergency area", "broken glass", "damaged shop", "street conflict", "riot", "panic crowd", "fallen person", "fire alarm", "street fire", "violent scene",
+    "crime scene", "shooting area", "injured person", "vandalized area", "traffic collision", "explosion site", "crowd running", "gas leak", "smashed window", "wrecked car",
+    "broken barrier", "robbery place", "fire zone", "shouting crowd", "gunfire sound", "debris", "alarm sound", "car fire", "collapsing structure", "screaming people",
+    "dangerous place", "fighting", "stealing", "breaking glass", "shooting", "stabbing", "burning", "falling", "collapsing", "running away",
+    "attacking", "chasing", "arguing", "punching", "kicking", "pushing", "escaping", "fainting", "bleeding", "vandalizing",
+    "trespassing", "jumping fence", "breaking in", "destroying property", "lying on ground", "robbing", "overturning table", "setting fire", "kicking door", "breaking window",
+    "shouting", "throwing objects", "pushing crowd", "smashing glass", "climbing wall", "reckless driving", "abnormal running", "jumping from height", "running across traffic", "throwing punches",
+    "violent action", "panic behavior", "car overturn", "running toward danger", "grabbing bag", "breaking lock", "sudden explosion", "emergency event", "crowd panic", "dangerous behavior", "person injured"
+    ]
+    
+    use_ta = True
+    use_ski = True
+    train_and_finetune_together = True
+    name = ''
+    if train_and_finetune_together:
+        name += '_train_and_finetune_together'
+    else:  
+        if use_ta:
+            name += '_TA'
+        if use_ski:
+            name += '_SKI'
+        elif not use_ta and not use_ski:
+            name += '_nothing'
+
+    model = OVVADModel(
+        clip_model=clip_model,
+        clip_processor=clip_processor,
+        normal_prompts=normal_prompts,
+        abnormal_prompts=abnormal_prompts,
+        num_classes=len(ALL_CLASSES),
+        use_ta=use_ta,
+        use_ski=use_ski
+    ).to(device)
+
+    model.ski_module.clip_processor = clip_processor
+    model.load_state_dict(torch.load(f'models/xd_ovvad_train{name}.pth', map_location=device))
+
+    if train_and_finetune_together == False:
+        model_finetune = OVVADModel(
+            clip_model=clip_model,
+            clip_processor=clip_processor,
+            normal_prompts=normal_prompts,
+            abnormal_prompts=abnormal_prompts,
+            num_classes=len(ALL_CLASSES),
+            use_ta=use_ta,
+            use_ski=use_ski
+        ).to(device)
+
+        model_finetune.ski_module.clip_processor = clip_processor
+        model_finetune.load_state_dict(torch.load(f'models/xd_ovvad_finetune{name}.pth', map_location=device))
+
+    list_file = r"./data/XD_Violence/Anomaly_Detection_splits/xd_CLIP_rgbtest.csv"  # 的实际txt文件路径
+
+    # 推荐 batch_size=1（或用前面给过的 pad_collate 保证不截断）
+    test_dataset = XDClipFeatFolderDatasetTest(
+        list_file=list_file,
+        max_frames=None,  # 或者给个很大的数；关键是不截断
+        anno_txt=r"./data/XD_Violence/E_Features/annotations.txt",
+        # video_root="/data/UCF_Crimes/Videos",  # 你的原始视频根目录
+        feat_stride=16  # 作为回退；线性缩放拿不到总帧数时才用
+    )
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    # 跑两个版本
+    print("==== 训练版本 ====")
+    test_with_ski_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+    if train_and_finetune_together == False:
+        print("==== 微调版本 ====")
+        test_with_ski_prompt(model_finetune, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+    # test_with_dummy_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+
+
+if __name__ == "__main__":
+    main()
+

@@ -3,21 +3,33 @@ from sympy import false
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch.nn.functional as F
-from model import OVVADModel, NASModule, topk_bce_loss, classification_loss, ski_sim_loss
+from model import OVVADModel, NASModule, topk_bce_loss, classification_loss, ski_sim_loss #model.py是最符合论文的模型设置
+# from model_new import OVVADModel, NASModule, topk_bce_loss, classification_loss, ski_sim_loss
 import os
 from transformers import CLIPModel, CLIPProcessor
 from torch.utils.data import SubsetRandomSampler
 import re
 from collections import Counter, defaultdict
-
+import pandas as pd
+import sys
+from ucf_test import test_with_ski_prompt,UCFClipFeatFolderDatasetTest
+import random
+from pathlib import Path
+import csv
+from datetime import datetime
+'''
+TH's change
+这部分是按照vadclip的标签重新排序了
+'''
 LABEL_MAP = {
-    1: ('B1', 'Arson', '纵火'),
-    2: ('B2', 'Assault', '攻击 / 殴打'),
-    3: ('B3', 'Burglary', '入室盗窃'),
-    4: ('B4', 'Explosion', '爆炸'),
-    5: ('B5', 'Fighting', '打架'),
-    6: ('B6', 'RoadAccidents', '交通事故'),
+    1: ('B1', 'Fighting', '打架'),
+    2: ('B2', 'Burglary', '入室盗窃'),
+    3: ('B4', 'Arson', '纵火'),
+    4: ('B5', 'Assault', '攻击 / 殴打'),
+    5: ('B6', 'RoadAccidents', '交通事故'),
+    6: ('G', 'Explosion', '爆炸'),
 }
+
 ENGLISH_TYPE_TO_LABEL = {v[1]: k for k, v in LABEL_MAP.items()}   # 'Arrest': 0, ...
 ENGLISH_TYPE_TO_CLASSNAME = {v[1]: v[1] for k, v in LABEL_MAP.items()}
 
@@ -48,7 +60,14 @@ class UCFClipFeatFolderDataset(Dataset):
 
         for line in lines:
             rel_path = line.strip()
-            rel_path_npy = rel_path.replace('.mp4', '.npy')
+            # rel_path_npy = rel_path.replace('.mp4', '.npy')
+            '''
+            TH's change
+            更改只取_1.npy。
+            因为师哥貌似是自己弄得数据集npy，没有数据增强。
+            其实取0应该和师哥的也是不对等的，因为0是取中间部分，但是没取完的。
+            '''
+            rel_path_npy = rel_path.replace('.mp4', '__0.npy')
             full_path = os.path.join(feat_root, rel_path_npy)
             if not os.path.exists(full_path):
                 print(f"[Warning] Missing file: {full_path}")
@@ -107,16 +126,18 @@ class UCFClipFeatFolderDataset(Dataset):
         return feat, text_prompt, torch.tensor(binary_label, dtype=torch.float32), torch.tensor(class_label, dtype=torch.long)
 
 
-def get_balanced_sampler(dataset):
+def get_balanced_sampler(dataset):#取同样输数量的正常和异常样本
     """
     dataset.labels: [0/1/-1/...]
     -1 or 0为正常，其余为异常
     """
     import random
     # 兼容你的标签设定，假如正常是-1，其余是异常
-    normal_indices = [i for i, label in enumerate(dataset.labels) if label in [-1, 0, 0.0]]
-    abnormal_indices = [i for i, label in enumerate(dataset.labels) if label not in [-1, 0, 0.0]]
+    normal_indices = [i for i, label in enumerate(dataset.labels) if label in [-1,-1.0]]
+    abnormal_indices = [i for i, label in enumerate(dataset.labels) if label not in [-1, -1.0]]
     min_len = min(len(normal_indices), len(abnormal_indices))
+    # print(f"normal_indices: {len(normal_indices)}, abnormal_indices: {len(abnormal_indices)}")
+    print(f"min_len: {min_len}")
     # 随机采样，打乱
     normal_sample = random.sample(normal_indices, min_len)
     abnormal_sample = random.sample(abnormal_indices, min_len)
@@ -124,11 +145,26 @@ def get_balanced_sampler(dataset):
     random.shuffle(indices)
     return SubsetRandomSampler(indices)
 
+def get_base_sampler(dataset):#提取异常样本，即训练集中的base异常
+    """
+    dataset.labels: [0/1/-1/...]
+    -1 or 0为正常，其余为异常
+    """
+    # 兼容你的标签设定，假如正常是-1，其余是异常
+    abnormal_indices = [i for i, label in enumerate(dataset.labels) if label not in [-1,-1.0]]
+    min_len = len(abnormal_indices)
+    # 随机采样，打乱
+    abnormal_sample = random.sample(abnormal_indices, min_len)
+    indices = abnormal_sample
+    # random.shuffle(indices)
+    return SubsetRandomSampler(indices)
+
+
 # 训练一个epoch
 def train_one_epoch(model, train_loader, optimizer, device, nas_module,
                    xd_feats_all, xd_prompts_all, xd_class_names_all, novel_class_map,
                    ski_text_emb,             # << 只传一份：SKI 提示词嵌入
-                   nas_batch_size=8):
+                   nas_batch_size=8,use_nas=False,train_and_finetune_together=False):
     # ==== 提取normal和abnormal prompt列表，并获得其索引（用于loss等）====
     normal_prompts = model.ski_module.prompt_list[:len(model.ski_module.prompt_list) // 2]
     abnormal_prompts = model.ski_module.prompt_list[len(model.ski_module.prompt_list) // 2:]
@@ -172,11 +208,23 @@ def train_one_epoch(model, train_loader, optimizer, device, nas_module,
         # nas_class_labels: [N]，每条novel类别编号
         # nas_prompts: list[N]，prompt文本
 
-        # ====== 3. 拼接主数据和NAS伪novel异常，形成一个训练大batch ======
-        feats_batch = torch.cat([video_feats, nas_feats], dim=0)           # [B+N, T, C]
-        labels_batch = torch.cat([binary_labels, nas_labels], dim=0)       # [B+N]
-        class_labels_batch = torch.cat([class_labels, nas_class_labels], dim=0)   # [B+N]
-        prompts_batch = list(text_prompts) + list(nas_prompts)             # list[B+N]
+
+        '''
+        TH's change
+        选择是否拼接nas，同步训练和微调。
+        '''
+        if train_and_finetune_together:
+            # ====== 拼接主数据和NAS伪novel异常，形成一个训练大batch ======
+            feats_batch = torch.cat([video_feats, nas_feats], dim=0)           # [B+N, T, C]
+            labels_batch = torch.cat([binary_labels, nas_labels], dim=0)       # [B+N]
+            class_labels_batch = torch.cat([class_labels, nas_class_labels], dim=0)   # [B+N]
+            prompts_batch = list(text_prompts) + list(nas_prompts)             # list[B+N]
+        else:
+            # ====== 不拼接nas，直接用原始数据进行训练 ====== 
+            feats_batch = video_feats            # [B+N, T, C]
+            labels_batch = binary_labels         # [B+N]
+            class_labels_batch = class_labels    # [B+N]
+            prompts_batch = list(text_prompts)   # list[B+N]
 
 
         # frame_logits, class_logits = model.forward_with_ski(x_ski, Ftext)   # 前向传播
@@ -189,7 +237,30 @@ def train_one_epoch(model, train_loader, optimizer, device, nas_module,
         loss_ce = classification_loss(class_logits, class_labels_batch)           # 多分类损失
         loss_ski = ski_sim_loss(feats_batch, ski_text_emb,
                                 class_labels_batch, normal_idx, abnormal_idx, normal_class_idx)
-        loss = loss_bce + loss_ce + loss_ski                 # 总loss
+        
+        '''
+        TH's change
+        更改，选择性用nas模块
+        如果不微调或者nas和主数据集一起训练，则这样计算loss
+        '''
+        if not use_nas or train_and_finetune_together:
+            loss = loss_bce + loss_ce + loss_ski                 # 总loss
+
+        else:
+            #接下来计算novel部分的loss
+            feats_batch_nas = nas_feats   
+            labels_batch_nas =  nas_labels     
+            class_labels_batch_nas = nas_class_labels
+            prompts_batch_nas = list(nas_prompts)             # list[B+N]
+
+            frame_logits_nas, class_logits_nas = model.forward(feats_batch_nas)
+
+            is_abnormal_nas = (class_labels_batch_nas != -1)  
+            loss_bce_nas = topk_bce_loss(frame_logits_nas, labels_batch_nas, is_abnormal_nas)        # 异常二分类损失
+            loss_ce_nas = classification_loss(class_logits_nas, class_labels_batch_nas)           # 多分类损失
+
+            loss = loss_bce_nas + loss_ce_nas + 0.1*(loss_bce + loss_ce) #λ参数在ucf数据集设置为0.1，在xd设为1
+
 
         optimizer.zero_grad()
         loss.backward()
@@ -203,42 +274,6 @@ def train_one_epoch(model, train_loader, optimizer, device, nas_module,
     avg_loss = total_loss / len(train_loader)
     print(f"Epoch Average Loss: {avg_loss:.4f}")
 
-# def train_one_epoch(model, train_loader, optimizer, device):
-#     model.train()
-#     total_loss = 0.0
-#
-#     for batch_idx, (video_feats, text_prompts, binary_labels, class_labels) in enumerate(train_loader):
-#         video_feats = video_feats.to(device)
-#         binary_labels = binary_labels.to(device)
-#         class_labels = class_labels.to(device)
-#
-#         optimizer.zero_grad()
-#
-#         # 这里dummy prompt_embs只为接口兼容，实际forward时不会被用到
-#         num_class = model.classifier.out_features
-#         prompt_embs = torch.ones(num_class, 512, device=device)
-#
-#         # 前向传播
-#         frame_logits, class_logits = model.forward(video_feats, prompt_embs)
-#
-#         # 只用二分类和分类损失，不计算SKI损失
-#         # train_one_epoch内
-#         is_abnormal = (class_labels != -1)
-#         loss_bce = topk_bce_loss(frame_logits, binary_labels, is_abnormal)
-#         loss_ce = classification_loss(class_logits, class_labels)
-#         loss = loss_bce + loss_ce
-#
-#
-#         loss.backward()
-#         optimizer.step()
-#
-#         total_loss += loss.item()
-#
-#         if (batch_idx + 1) % 5 == 0:
-#             print(f"Step [{batch_idx + 1}/{len(train_loader)}] Loss: {loss.item():.4f}")
-#
-#     avg_loss = total_loss / len(train_loader)
-#     print(f"Epoch Average Loss: {avg_loss:.4f}")
 
 
 # 主函数
@@ -246,23 +281,64 @@ def main():
     # 1. 设备选择（GPU优先，没有则用CPU）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 2. 加载CLIP主干模型和处理器（需替换为你的实际权重文件路径）
-    clip_model = CLIPModel.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")
-    clip_processor = CLIPProcessor.from_pretrained("/home/cxa/huggingface/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3")
+    clip_model = CLIPModel.from_pretrained("./clip/clip_model")
+    clip_processor = CLIPProcessor.from_pretrained("./clip/clip_processor")
+    
+
     clip_model = clip_model.to(device)
 
     # 3. 定义normal和abnormal的prompt（按你的类别定义，可与ALL_CLASSES保持一致）
-    normal_prompts = [    "street","sidewalk","crosswalk","alley","parking lot","gas station","shopping mall",
-    "supermarket aisle","convenience store","checkout counter","office lobby","school hallway",
-    "metro station","train platform","bus stop","park","plaza","playground","residential block",
-    "apartment corridor","elevator lobby","stairwell","warehouse aisle","loading dock","campus quad",
-    "cafeteria","hotel lobby","pharmacy","bank lobby","public square"]
-    abnormal_prompts = [    "walking","standing","queueing","browsing shelves","window shopping","talking","calling on a phone",
-    "texting","jogging","cycling","pushing a cart","carrying bags","entering","exiting","waiting",
-    "cleaning","sweeping","mopping","stocking goods","delivering packages","checking out",
-    "paying at cashier","taking an escalator","using an elevator","stretching","tying shoelaces",
-    "adjusting a backpack","greeting","waving","sitting on a bench"]
+    '''
+    #第三版，各一百个，动名词混合  
+    '''
+    normal_prompts = [
+    "street", "park", "office", "classroom", "kitchen", "supermarket", "shopping mall", "restaurant", "cafeteria", "library",
+    "parking lot", "hospital", "corridor", "laboratory", "train station", "bus stop", "playground", "meeting room", "garden", "living room",
+    "office desk", "shop", "lobby", "hallway", "crosswalk", "market", "coffee shop", "sports field", "warehouse", "subway station",
+    "gym", "cinema", "home", "elevator", "store", "museum", "reception desk", "bridge", "stadium", "canteen",
+    "corridor area", "computer room", "dining area", "public square", "campus", "office building", "bank", "bakery", "bus interior", "car interior",
+    "walking", "running", "talking", "reading", "cooking", "cleaning", "studying", "resting", "driving", "parking",
+    "eating", "drinking", "working", "chatting", "shopping", "typing", "relaxing", "exercising", "walking dog", "sitting",
+    "standing", "waiting", "watching", "opening door", "closing door", "paying bill", "queuing", "crossing street", "answering phone", "checking phone",
+    "taking photos", "folding clothes", "watering plants", "walking upstairs", "walking downstairs", "teaching", "attending meeting", "loading luggage", "unloading luggage", "walking together",
+    "delivering package", "browsing shelves", "people gathering", "walking on sidewalk", "sitting quietly", "walking through hallway", "resting on chair", "people passing by"
+    ]
 
+    abnormal_prompts = [
+    "fire", "explosion", "smoke", "blood", "weapon", "knife", "gun", "firelight", "firetruck", "police car",
+    "ambulance", "fight scene", "robbery scene", "crash site", "burning vehicle", "destroyed building", "collapsed wall", "crowd chaos", "dangerous road", "car accident",
+    "emergency area", "broken glass", "damaged shop", "street conflict", "riot", "panic crowd", "fallen person", "fire alarm", "street fire", "violent scene",
+    "crime scene", "shooting area", "injured person", "vandalized area", "traffic collision", "explosion site", "crowd running", "gas leak", "smashed window", "wrecked car",
+    "broken barrier", "robbery place", "fire zone", "shouting crowd", "gunfire sound", "debris", "alarm sound", "car fire", "collapsing structure", "screaming people",
+    "dangerous place", "fighting", "stealing", "breaking glass", "shooting", "stabbing", "burning", "falling", "collapsing", "running away",
+    "attacking", "chasing", "arguing", "punching", "kicking", "pushing", "escaping", "fainting", "bleeding", "vandalizing",
+    "trespassing", "jumping fence", "breaking in", "destroying property", "lying on ground", "robbing", "overturning table", "setting fire", "kicking door", "breaking window",
+    "shouting", "throwing objects", "pushing crowd", "smashing glass", "climbing wall", "reckless driving", "abnormal running", "jumping from height", "running across traffic", "throwing punches",
+    "violent action", "panic behavior", "car overturn", "running toward danger", "grabbing bag", "breaking lock", "sudden explosion", "emergency event", "crowd panic", "dangerous behavior", "person injured"
+    ]
+    
+
+    use_ta = True
+    use_ski = True
+    train_and_finetune_together = True
+    lr = 5e-4
+    name = ''
+    if train_and_finetune_together:
+        name = "TA_SKI_NAS"
+    elif use_ta and use_ski:
+        name = "TA_SKI"
+    elif use_ta:
+        name = "TA"
+    elif use_ski:
+        name = "SKI"
+    else:
+        name = "nothing"
+    
+    SEED=[42,42,42]
+
+    random.seed(SEED[0])
+    np.random.seed(SEED[1])
+    torch.manual_seed(SEED[2])  # 固定种子，确保结果可复现
     # 4. 初始化主模型，设置类别数、是否启用各模块
     model = OVVADModel(
         clip_model=clip_model,
@@ -270,19 +346,24 @@ def main():
         normal_prompts=normal_prompts,
         abnormal_prompts=abnormal_prompts,
         num_classes=len(ALL_CLASSES),
-        use_ta=True,    # 是否使用 Temporal Adapter
-        use_ski=True    # 是否使用 Semantic Knowledge Injection
+        use_ta=use_ta,    # 是否使用 Temporal Adapter
+        use_ski=use_ski    # 是否使用 Semantic Knowledge Injection
     ).to(device)
+
+    # model.load_state_dict(torch.load(f'./models/ucf_ovvad_train_{name}.pth'))
 
     # 5. 初始化NAS模块，用于动态生成伪novel异常样本
     nas_module = NASModule(feature_dim=512).to(device)
 
+
     # 6. 优化器，包含主模型和NAS模块参数
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(nas_module.parameters()), lr=1e-4)
+    # optimizer = torch.optim.Adam(list(model.parameters()) + list(nas_module.parameters()), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr) #训练阶段没有用到nas模块产生的异常样本，本质是nas也没有可训练参数
 
     # === UCF主训练集数据加载 ===
-    FEAT_ROOT = "/data/UCF_Crimes/Features/Video"  #/data/UCF_Crimes/Features/Video
-    TRAIN_TXT = "/data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Train.txt"
+    FEAT_ROOT = r"./data/UCF_Crimes/Features/Video"  #/data/UCF_Crimes/Features/Video
+    # TRAIN_TXT = "/data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Train.txt"
+    TRAIN_TXT = r"./data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Train.txt"
     train_dataset = UCFClipFeatFolderDataset(
         FEAT_ROOT,
         list_file=TRAIN_TXT,
@@ -292,11 +373,33 @@ def main():
 
     # === XD异常池加载：读取10个XD异常的npy特征，并对齐prompt和类别名 ===
     xd_feat_dir = './xd_nas/'
-    feat_files = sorted([os.path.join(xd_feat_dir, f) for f in os.listdir(xd_feat_dir) if f.endswith('.npy')])
 
+    # feat_files = sorted([os.path.join(xd_feat_dir, f) for f in os.listdir(xd_feat_dir) if f.endswith('.npy')])
+    '''
+    TH's change
+    注意xd数据集有多标签数据，剔除
+    or
+    可以替换为ucf的novel部分
+    '''
+    # list_file = r"./data/XD_Violence/Anomaly_Detection_splits/xd_CLIP_rgb_only_zero.csv"
+    list_file = r"./data/UCF_Crimes/Anomaly_Detection_splits/ucf_CLIP_rgb_only_zero.csv"
+    feat_files = []
+    df = pd.read_csv(list_file, header=0)  # header=0表示第一行为表头，无表头可设为None
+
+    all_path = df.iloc[:, 0]
+    all_label = df.iloc[:, 1]
+    for path, label in zip(all_path, all_label):
+        if not os.path.exists(path):
+            print(f"[Warning] Missing file: {path}")
+            continue
+        elif label == 'A' or label == 'Normal':
+            continue
+        feat_files.append(path)
+    
     max_frames = 256
     xd_feats_list = []
     xd_prompts_list = []
+    
     xd_class_names_list = []
     for f in feat_files:
         arr = np.load(f)  # [T, 512]，单个XD异常片段特征
@@ -307,17 +410,51 @@ def main():
             arr = np.concatenate([arr, pad], axis=0)
         else:
             arr = arr[:max_frames]
-        xd_feats_list.append(torch.tensor(arr, dtype=torch.float32))
-        # 解析异常类型英文名（如Explosion），后续与类别编号对齐
-        m = re.search(r'label_(B\d)', f)
-        if m:
-            code = m.group(1)            # 例如 'B2'
-            label_idx = int(code[1])
-            eng_type = LABEL_MAP[label_idx][1]  # 英文类型名（如 'Explosion'）
-        else:
-            eng_type = 'Unknown'
-        xd_prompts_list.append(eng_type.lower())   # 小写prompt文本
-        xd_class_names_list.append(eng_type)       # 英文类别名
+
+        '''
+        TH's change
+        按照新的label进行新的正则和映射
+        并且保持一致，只取__1.npy的文件
+        '''
+        # 匹配两种格式：
+        # 1. label_B数字（如 label_B1、label_B2）
+        # 2. label_G（单独的G，无数字）
+
+        # 1. 提取文件名（排除路径，只取文件名部分）
+        filename = os.path.basename(f)  # 例如从"/xxx/abc__1.npy"中提取"abc__1.npy"
+        # 2. 判断文件名是否以 ".npy" 结尾
+        if filename.endswith(".npy"):
+            m = re.search(r'label_(B\d|G)', f)  # 核心：用 | 分隔两个分支
+            m_ucf = re.search(r'^[A-Za-z]+(?=\d)', filename)    
+            if m:
+                code = m.group(1)  # 提取匹配到的内容（如 'B3' 或 'G'）
+                if code.startswith('B'):
+                    # B类：取数字部分（如 'B3' → 3）
+                    label_idx = int(code[1:])  # code[1:] 取 'B' 后面的数字
+                    if label_idx >=4:
+                        label_idx = label_idx - 1 #因为没有label3类，所以有错位
+                    eng_type = LABEL_MAP[label_idx][1] if label_idx < len(LABEL_MAP) else 'Unknown'
+                else:  # code 是 'G'
+                    # G类：单独处理（假设对应固定索引，如 LABEL_MAP[0] 或单独定义）
+                    # 需根据实际LABEL_MAP中G的位置调整，这里举例G对应索引9
+                    label_idx = 6  # 假设G类在LABEL_MAP中的索引是9
+                    eng_type = LABEL_MAP[label_idx][1]
+            elif m_ucf:
+                code = m_ucf.group(0) 
+                eng_type = code
+            else:
+                eng_type = 'Unknown'
+                label_idx = -1
+                print(f"未匹配到ucf或xd作为nas: {filename}")
+            # print(f"code: {code}, eng_type: {eng_type}")
+            '''
+            TH's change.
+            只将xd中属于ucf的novel类别的异常加入集合
+            '''
+            if eng_type in NOVEL_CLASSES:
+                xd_prompts_list.append(eng_type.lower())   # 小写prompt文本
+                xd_class_names_list.append(eng_type)       # 英文类别名
+                xd_feats_list.append(torch.tensor(arr, dtype=torch.float32))
 
     # 汇总XD异常池到tensor和list
     xd_feats_all = torch.stack(xd_feats_list)      # [N, T, 512]
@@ -341,33 +478,135 @@ def main():
     ski_prompts = model.ski_module.prompt_list  # 初始化时= normal_prompts + abnormal_prompts
     ski_text_emb = model.ski_module.get_clip_emb(ski_prompts).to(device)
 
+    #加载测试集
+    test_FEAT_ROOT = r"./data/UCF_Crimes/Features/Video"   # 测试集特征主目录
+    test_list_file = r"./data/UCF_Crimes/Anomaly_Detection_splits/Anomaly_Test.txt"  # 的实际txt文件路径
+
+    # 推荐 batch_size=1（或用前面给过的 pad_collate 保证不截断）
+    test_dataset = UCFClipFeatFolderDatasetTest(
+        test_FEAT_ROOT,
+        list_file=test_list_file,
+        max_frames=None,  # 或者给个很大的数；关键是不截断
+        anno_txt=r"./data/UCF_Crimes/E_Features/Temporal_Anomaly_Annotation.txt",
+        # video_root="/data/UCF_Crimes/Videos",  # 你的原始视频根目录
+        feat_stride=16  # 作为回退；线性缩放拿不到总帧数时才用
+    )
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    #记录checkpoint
+    csv_filename = f"./checkpoint/UCF_Enhanced_{name}_{SEED}_lr-{lr}.csv"
+    csv_path = Path(csv_filename)  # 确保路径正确
+    if csv_path.exists():
+        # 拆分文件名和扩展名，添加_copy后重新组合
+        csv_path = csv_path.with_name(f"{csv_path.stem}_copy{csv_path.suffix}")
+    
+    # 确保父目录存在
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        # 表头顺序：epoch + 所有指标
+        writer.writerow([
+            "epoch", 
+            "overall_auc", "base_auc", "novel_auc",
+            "overall_ap", "base_ap", "novel_ap"
+        ])
+
+    auc_best = 0.0
     # === 训练主循环 ===
     for epoch in range(1, epochs + 1):
-        print(f"\nEpoch {epoch}/{epochs}")
+        print(f"\ntrain_Epoch {epoch}/{epochs}")
 
-        # 每轮都重新平衡采样，防止类别/标签分布不均
+        '''
+        每轮都重新平衡采样，防止类别/标签分布不均
+        或者
+        sampler= none
+        shuffle = True
+        完全利用所有训练样本
+        '''
         sampler = get_balanced_sampler(train_dataset)
         train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, sampler=sampler,
-            num_workers=4, drop_last=True
+            train_dataset, batch_size=batch_size, 
+            sampler=sampler,
+            num_workers=4, drop_last=True,
+            # shuffle=True
         )
 
-        # 每个batch内动态注入NAS伪novel异常，训练整体loss
+        # 训练阶段不加入NAS，训练整体loss
         train_one_epoch(
             model, train_loader, optimizer, device, nas_module,
             xd_feats_all, xd_prompts_all, xd_class_names_all, novel_class_map,
             ski_text_emb,  # << 用这份给 SKI
-            nas_batch_size=8  # << 原来是 0，建议 >=8
+            nas_batch_size=8,  # << 原来是 0，建议 >=8
+            use_nas=False,
+            train_and_finetune_together=train_and_finetune_together
         )
 
         # train_one_epoch(
         #     model, train_loader, optimizer, device
         # )
+        overall_auc,base_auc,novel_auc,overall_ap,base_ap,novel_ap= test_with_ski_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+        if overall_auc > auc_best:
+            auc_best = overall_auc
+            # 保存模型
+            os.makedirs('models', exist_ok=True)
+            torch.save(model.state_dict(), f'models/ucf_ovvad_train_{name}.pth')
 
-    # === 保存最终模型参数 ===
-    os.makedirs('models', exist_ok=True)
-    torch.save(model.state_dict(), 'models/ucf_ovvad_final.pth')
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch,
+                round(overall_auc, 4),  # 保留4位小数
+                round(base_auc, 4),
+                round(novel_auc, 4),
+                round(overall_ap, 4),
+                round(base_ap, 4),
+                round(novel_ap, 4)
+            ])
+    
+    print(f"\nTraining complete. Best Overall AUC: {auc_best:.4f}")
 
+    '''
+    TH's change
+    添加NAS微调
+    '''
+    # if train_and_finetune_together == True:
+    #     sys.exit()
+    # # == NAS微调主循环 ==
+    # # == 加载model_finetune方式二选一，一个是一路训练下来，一个是从本地加载 ==
+    # model_finetune = model.to(device) #注意，在python中，这里并没有创建新的实力，而是引用，所以其实是一个东西。
+    # model_finetune.load_state_dict(torch.load(f'models/ucf_ovvad_train_{name}.pth'))#如果是直接微调用加载,要加载最优的模型微调，而不是直接用最后一轮model
+
+    # finetune_epoches = 10
+    # finetune_batch_size = 10
+    # # optimizer_finetune = torch.optim.Adam(list(model_finetune.parameters()) + list(nas_module.parameters()), lr=5e-6)
+    # optimizer_finetune = torch.optim.Adam(model_finetune.parameters(), lr=5e-6)#nas没有可训练参数，本质没区别
+
+    # auc_finetune_best = 0.0
+    # for epoch in range(1, finetune_epoches + 1):
+    #     print(f"\nfinetune_Epoch {epoch}/{finetune_epoches}")
+    #     base_sampler = get_base_sampler(train_dataset)#获取base异常
+    #     # base_sampler = get_balanced_sampler(train_dataset)#获取正常数据集，可以试一下是不是加了正常数据集微调就可以正确。
+    #     loader_finetune = DataLoader(
+    #         train_dataset, batch_size=finetune_batch_size, sampler=base_sampler,
+    #         num_workers=4, drop_last=True
+    #     )
+    #     #每个batch内动态注入NAS伪novel异常
+    #     train_one_epoch(
+    #         model_finetune, loader_finetune, optimizer_finetune, device, nas_module,
+    #         xd_feats_all, xd_prompts_all, xd_class_names_all, novel_class_map,
+    #         ski_text_emb,  # << 用这份给 SKI
+    #         nas_batch_size=finetune_batch_size,  # 每批次取10个base和10个nas
+    #         use_nas=True,
+    #         train_and_finetune_together=train_and_finetune_together
+    #     )
+    #     overall_auc,base_auc,novel_auc,overall_ap,base_ap,novel_ap_ = test_with_ski_prompt(model, test_loader, device, BASE_CLASSES, NOVEL_CLASSES)
+    #     if overall_auc > auc_finetune_best:
+    #         auc_finetune_best = overall_auc
+    #         # 保存模型
+    #         os.makedirs('models', exist_ok=True)
+    #         torch.save(model_finetune.state_dict(), f'models/ucf_ovvad_finetune_{name}.pth')
+    
 
 if __name__ == '__main__':
     main()

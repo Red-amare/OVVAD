@@ -26,9 +26,13 @@ class TemporalAdapter(nn.Module):
         x = self.ln(x)  # 层归一化
         return x
 
+'''
+TH's change
+由于要删除ski模块时要保留ski模块中的一些函数，遂做一些更改
+'''
 # SKI 模块：语义知识注入模块
 class SKIModule(nn.Module):
-    def __init__(self, clip_model, clip_processor, normal_prompts, abnormal_prompts):
+    def __init__(self, clip_model, clip_processor, normal_prompts, abnormal_prompts,use_ski=True):
         super().__init__()
         self.clip_model = clip_model  # CLIP模型用于获取文本特征
         self.clip_processor = clip_processor  # CLIP的文本处理器
@@ -37,6 +41,7 @@ class SKIModule(nn.Module):
         # 通过 CLIP 提取语义嵌入
         self.semantic_emb = self.get_clip_emb(self.prompt_list)
         self.semantic_emb = nn.Parameter(self.semantic_emb, requires_grad=False)  # 固定参数
+        self.use_ski = use_ski  # 是否使用SKI模块
 
     def get_clip_emb(self, prompts):
         # prompts: List[str]
@@ -52,6 +57,12 @@ class SKIModule(nn.Module):
         xt: 视频帧特征 [B, T, C]
         计算视频特征与语义嵌入之间的相似度，并注入语义知识
         """
+        '''
+        TH's change
+        不用SKI模块时，直接返回xt
+        '''
+        if self.use_ski == False:
+            return xt
         sim = torch.sigmoid(torch.matmul(xt, self.semantic_emb.T))  # 计算视频特征与语义嵌入的相似度
         f_know = torch.matmul(sim, self.semantic_emb) / self.prompt_num  # 将相似度加权求平均
         x_ski = torch.cat([xt, f_know], dim=-1)  # 拼接视觉特征和语义知识
@@ -88,32 +99,6 @@ class NASModule(nn.Module):
         # 返回：特征、异常二分类标签、novel类别标签、prompt文本
         # 可直接拼接到主训练batch，实现正常+base异常+NAS异常混合训练
         return ext_feats, synthetic_labels, synthetic_class_labels, synthetic_prompts
-
-# class NASModule(nn.Module):
-#     """
-#     NAS (Novel Anomaly Synthesis)模块，用于将外部输入的伪novel异常特征和对应prompt整合为训练样本。
-#     这里不做特征生成，仅起到“适配器”作用。
-#     """
-#     def __init__(self, feature_dim=512):
-#         super(NASModule, self).__init__()
-#         self.feature_dim = feature_dim
-#
-#     def forward(self, ext_feats, ext_prompts, novel_class_idx):
-#         """
-#         ext_feats: [N, T, C] tensor，外部输入（如XD异常片段特征）
-#         ext_prompts: list[str]，每条特征对应的prompt（类别名称）
-#         novel_class_idx: int 或 list[int]，novel类别的label编码
-#         """
-#         device = ext_feats.device
-#         N = ext_feats.shape[0]
-#         # 构造异常标签和类别标签
-#         synthetic_labels = torch.ones(N, device=device)   # [N]，异常标签=1
-#         if isinstance(novel_class_idx, int):
-#             synthetic_class_labels = torch.full((N,), novel_class_idx, dtype=torch.long, device=device)
-#         else:
-#             synthetic_class_labels = torch.tensor(novel_class_idx, dtype=torch.long, device=device)
-#         synthetic_prompts = ext_prompts
-#         return ext_feats, synthetic_labels, synthetic_class_labels, synthetic_prompts
 
 
 
@@ -156,12 +141,14 @@ def classification_loss(class_logits, class_labels):
     计算分类损失
     只对有异常类别标签的样本（class_labels != -1）计算多类交叉熵损失
     """
+    
     class_labels = class_labels.view(-1).long()  # 保证是一维 int64
+    
     mask = (class_labels >= 0)
     if mask.sum() == 0:
         return torch.tensor(0.0, device=class_logits.device)
     # 只有标签>=0才允许用作交叉熵
-    return F.cross_entropy(class_logits[mask], class_labels[mask])
+    return F.cross_entropy(class_logits[mask], class_labels[mask]) #函数内部会进行softmax归一化，使得概率和为1
 
 # SKI 模块相似度损失
 def ski_sim_loss(video_feats, prompt_embs, class_labels, normal_idx, abnormal_idx, normal_class_idx, top_ratio=0.1):
@@ -203,13 +190,21 @@ class OVVADModel(nn.Module):
 
         # Temporal Adapter（TA）：建模帧级时序依赖，提升检测泛化能力
         self.temporal_adapter = TemporalAdapter() if use_ta else nn.Identity()
-
+        
+        '''
+        TH's change
+        更改use_ski为false的初始化
         # SKI模块：注入CLIP文本prompt语义知识，拼接到视频帧特征
         self.ski_module = SKIModule(clip_model, clip_processor, normal_prompts,
                                     abnormal_prompts) if use_ski else nn.Identity()
+        '''
+        # SKI模块：注入CLIP文本prompt语义知识，拼接到视频帧特征
+        self.ski_module = SKIModule(clip_model, clip_processor, normal_prompts,
+                                    abnormal_prompts,use_ski)
 
         # 输入维度
         self.input_dim = 1024 if use_ski else 512
+        # self.input_dim = 512
 
         # 帧级打分头（保留你原来的）
         hidden_dim = self.input_dim
@@ -233,6 +228,7 @@ class OVVADModel(nn.Module):
         # 温度参数（类似CLIP的logit_scale）
         # 你可以初始化为 ln(14.285)=≈2.659（CLIP默认1/0.07），这里给个适中值
         self.logit_scale = nn.Parameter(torch.tensor(math.log(14.285)))
+        
 
     @torch.no_grad()
     def set_class_text_emb(self, text_emb: torch.Tensor):
@@ -256,11 +252,11 @@ class OVVADModel(nn.Module):
 
         # 4) 基于帧分数的attention聚合（建议对 x_ski 聚合，和文本更对齐）
         attn = torch.softmax(frame_logits, dim=1).unsqueeze(-1)
-        video_repr = (x_ski * attn).sum(dim=1)                 # [B, input_dim]
+        video_repr = (x_ta * attn).sum(dim=1)                 # [B, input_dim]
 
         # 5) 文本对齐式分类
         vid_feat = self.fc_video_repr(video_repr)              # [B, 512]
-        vid_feat = F.normalize(vid_feat, dim=-1)               # 归一化
+        vid_feat = F.normalize(video_repr, dim=-1)               # 归一化
 
         # 类别原型 = 冻结的文本嵌入 + 可学习delta（再归一化）
         cls_emb = self.class_text_emb + self.text_delta        # [num_cls, 512]
